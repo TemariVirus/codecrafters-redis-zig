@@ -1,7 +1,8 @@
 const std = @import("std");
-const assert = std.debug.assert;
 const AnyReader = std.io.AnyReader;
 const AnyWriter = std.io.AnyWriter;
+const assert = std.debug.assert;
+const log = std.log;
 const net = std.net;
 
 const Resp = enum(u8) {
@@ -47,53 +48,54 @@ pub fn main() !void {
 
 fn workerNoError(conn: net.Server.Connection) void {
     worker(conn) catch |err| {
-        std.debug.print("Error in worker thread: {}\n", .{err});
+        log.warn("Error in worker thread: {}", .{err});
     };
 }
 
 fn worker(conn: net.Server.Connection) !void {
-    defer std.debug.print("Connection closed\n", .{});
+    defer log.info("Connection closed", .{});
     defer conn.stream.close();
 
     var command_buffer: [1024]u8 = undefined;
-    std.debug.print("Accepted connection\n", .{});
+    log.info("Accepted connection", .{});
 
     const reader = conn.stream.reader().any();
     const writer = conn.stream.writer().any();
-    var arg_count: usize = undefined;
+    var str_count: usize = undefined;
     _ = state: switch (CommandState.read_arr_len) {
         .read_arr_len => {
             const len_str = readPart(reader, &command_buffer) orelse return;
             assert(len_str[0] == @intFromEnum(Resp.array));
-            arg_count = std.fmt.parseInt(usize, len_str[1..], 10) catch {
-                std.debug.print("Failed to parse array length: {s}\n", .{len_str[1..]});
+            str_count = std.fmt.parseInt(usize, len_str[1..], 10) catch {
+                log.warn("Failed to parse array length: {s}", .{len_str[1..]});
                 return;
             };
 
-            std.debug.print("Read arr length {d}\n", .{arg_count});
+            log.debug("Read array length {d}", .{str_count});
             continue :state .read_str_len;
         },
         .read_str_len => {
             const len_str = readPart(reader, &command_buffer) orelse return;
             assert(len_str[0] == @intFromEnum(Resp.bulk_string));
             const len = std.fmt.parseInt(usize, len_str[1..], 10) catch {
-                std.debug.print("Failed to parse string length: {s}\n", .{len_str[1..]});
+                log.warn("Failed to parse string length: {s}", .{len_str[1..]});
                 return;
             };
-            std.debug.print("Read str length {d}\n", .{len});
+
+            log.debug("Read str length {d}", .{len});
             continue :state .read_str_data;
         },
         .read_str_data => {
             const data = readPart(reader, &command_buffer) orelse return;
-            std.debug.print("Read str data {s}\n", .{data});
-            arg_count -= 1;
-            if (arg_count == 0) {
+            log.debug("Read str data {s}", .{data});
+            str_count -= 1;
+            if (str_count == 0) {
                 continue :state .respond;
             }
             continue :state .read_str_len;
         },
         .respond => {
-            std.debug.print("responding\n", .{});
+            log.debug("responding", .{});
 
             // Hardcoded PONG
             try writer.print("{}PONG\r\n", .{Resp.simple_string});
@@ -108,46 +110,9 @@ fn worker(conn: net.Server.Connection) !void {
 /// Otherwise, writes the data without the delimiter to `buf`.
 fn readPart(reader: AnyReader, buf: []u8) ?[]u8 {
     var fbs = std.io.fixedBufferStream(buf);
-    while (true) {
-        // Would be nice to do this without blocking, but will have to wait for zig 0.15
-        reader.streamUntilDelimiter(fbs.writer(), '\r', null) catch |err| switch (err) {
-            // Connection closed
-            error.ConnectionResetByPeer,
-            error.ConnectionTimedOut,
-            error.EndOfStream,
-            => return null,
-            else => {
-                const src = @src();
-                std.debug.print(
-                    "{} in {s}() in {s}:{d}\n",
-                    .{ err, src.fn_name, src.file, src.line },
-                );
-                return null;
-            },
-        };
-        break;
-    }
-
+    // Would be nice to do this without blocking, but will have to wait for zig 0.15
+    reader.streamUntilDelimiter(fbs.writer(), '\r', null) catch return null;
     // Skip trailing \n
-    while (true) {
-        reader.skipBytes(1, .{ .buf_size = 1 }) catch |err| switch (err) {
-            // Connection closed
-            error.ConnectionResetByPeer,
-            error.ConnectionTimedOut,
-            error.EndOfStream,
-            => return null,
-            else => {
-                std.debug.print("{} in {s}() in {s}:{d}\n", .{
-                    err,
-                    @src().fn_name,
-                    @src().file,
-                    @src().line,
-                });
-                return null;
-            },
-        };
-        break;
-    }
-
+    reader.skipBytes(1, .{ .buf_size = 1 }) catch return null;
     return fbs.getWritten();
 }
