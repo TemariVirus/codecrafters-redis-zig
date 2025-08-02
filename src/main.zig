@@ -25,14 +25,18 @@ const Resp = enum(u8) {
 
 const CommandType = enum {
     echo,
+    get,
     ping,
+    set,
 
     pub const string_to_type: std.StaticStringMapWithEql(
         CommandType,
         std.ascii.eqlIgnoreCase,
     ) = .initComptime(.{
         .{ "echo", .echo },
+        .{ "get", .get },
         .{ "ping", .ping },
+        .{ "set", .set },
     });
 
     pub fn parse(str: []const u8) ?CommandType {
@@ -133,8 +137,13 @@ const Command = struct {
     }
 };
 
+var store: std.StringHashMap([]const u8) = undefined;
+
 pub fn main() !void {
     const allocator = std.heap.smp_allocator;
+
+    // Don't bother cleaning up the store as it has the same lifetime as the application
+    store = .init(allocator);
 
     const address = try net.Address.resolveIp("127.0.0.1", 6379);
     var listener = try address.listen(.{ .reuse_address = true });
@@ -179,9 +188,13 @@ fn worker(allocator: Allocator, conn: net.Server.Connection) !void {
                 return err;
             },
         };
-        log.info("Received: {}\n", .{command});
+        defer command.deinit(allocator);
 
-        try handle(writer, command);
+        log.info("Received: {}\n", .{command});
+        handle(writer, command) catch |err| {
+            try respond(writer, .simple_error, @errorName(err));
+            return err;
+        };
     }
 }
 
@@ -194,15 +207,43 @@ fn handle(writer: AnyWriter, command: Command) !void {
             }
             try respond(writer, .bulk_string, command.args[0]);
         },
+        .get => {
+            if (command.args.len < 1) {
+                try respond(writer, .simple_error, "GET requries 1 argument");
+                return;
+            }
+            const key = command.args[0];
+            const value = store.get(key);
+            try respond(writer, .bulk_string, value);
+        },
         .ping => try respond(writer, .simple_string, "PONG"),
+        .set => {
+            if (command.args.len < 2) {
+                try respond(writer, .simple_error, "SET requries 2 arguments");
+                return;
+            }
+            const key = try store.allocator.dupe(u8, command.args[0]);
+            errdefer store.allocator.free(key);
+            const value = try store.allocator.dupe(u8, command.args[1]);
+            errdefer store.allocator.free(value);
+            try store.put(key, value);
+            try respond(writer, .simple_string, "OK");
+        },
     }
 }
 
-fn respond(writer: AnyWriter, kind: Resp, data: anytype) !void {
+fn respond(writer: AnyWriter, comptime kind: Resp, data: anytype) !void {
     switch (kind) {
         .simple_string, .simple_error => try writer.print("{}{s}\r\n", .{ kind, data }),
         .integer => try writer.print("{}{d}\r\n", .{ kind, data }),
-        .bulk_string => try writer.print("{}{d}\r\n{s}\r\n", .{ kind, data.len, data }),
+        .bulk_string => switch (@typeInfo(@TypeOf(data))) {
+            .optional => if (data) |str| {
+                try writer.print("{}{d}\r\n{s}\r\n", .{ kind, str.len, str });
+            } else {
+                try writer.print("{}-1\r\n", .{kind});
+            },
+            else => try writer.print("{}{d}\r\n{s}\r\n", .{ kind, data.len, data }),
+        },
         .array => @panic("TODO"),
     }
 }
