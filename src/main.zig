@@ -24,12 +24,14 @@ const Resp = enum(u8) {
 };
 
 const CommandType = enum {
+    echo,
     ping,
 
     pub const string_to_type: std.StaticStringMapWithEql(
         CommandType,
         std.ascii.eqlIgnoreCase,
     ) = .initComptime(.{
+        .{ "echo", .echo },
         .{ "ping", .ping },
     });
 
@@ -169,18 +171,38 @@ fn worker(allocator: Allocator, conn: net.Server.Connection) !void {
             error.Unsupported => {
                 // TODO: change this from a string to an error
                 // Left as a string for now for easier local debugging
-                try writer.print("{}Unsupported command\r\n", .{Resp.simple_string});
+                try respond(writer, .simple_string, "Unsupported command");
                 continue;
             },
             else => {
-                try writer.print("{}Unexpected\r\n", .{Resp.simple_error});
+                try respond(writer, .simple_error, "Unexpected");
                 return err;
             },
         };
         log.info("Received: {}\n", .{command});
-        log.debug("responding", .{});
 
-        // Hardcoded PONG
-        try writer.print("{}PONG\r\n", .{Resp.simple_string});
+        try handle(writer, command);
+    }
+}
+
+fn handle(writer: AnyWriter, command: Command) !void {
+    switch (command.command) {
+        .echo => {
+            if (command.args.len < 1) {
+                try respond(writer, .simple_error, "ECHO requries 1 argument");
+                return;
+            }
+            try respond(writer, .bulk_string, command.args[0]);
+        },
+        .ping => try respond(writer, .simple_string, "PONG"),
+    }
+}
+
+fn respond(writer: AnyWriter, kind: Resp, data: anytype) !void {
+    switch (kind) {
+        .simple_string, .simple_error => try writer.print("{}{s}\r\n", .{ kind, data }),
+        .integer => try writer.print("{}{d}\r\n", .{ kind, data }),
+        .bulk_string => try writer.print("{}{d}\r\n{s}\r\n", .{ kind, data.len, data }),
+        .array => @panic("TODO"),
     }
 }
