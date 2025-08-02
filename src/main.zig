@@ -65,7 +65,6 @@ const Command = struct {
                 log.warn("Failed to parse array length: {s}", .{len_str[1..]});
                 return error.Invalid;
             };
-            log.debug("Read array length {d}", .{len});
 
             if (len == 0) {
                 return error.Invalid;
@@ -86,11 +85,9 @@ const Command = struct {
                 log.warn("Failed to parse string length: {s}", .{len_str[1..]});
                 return error.Invalid;
             };
-            log.debug("Read str length {d}", .{len});
 
             args.appendAssumeCapacity(try allocator.alloc(u8, len));
             const data = try readPart(reader, args.items[i]);
-            log.debug("Read str data {s}", .{data});
             assert(data.len == args.items[i].len);
         }
 
