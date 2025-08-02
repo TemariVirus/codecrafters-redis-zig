@@ -1,6 +1,23 @@
 const std = @import("std");
 const net = std.net;
 
+const Resp = enum(u8) {
+    simple_string = '+',
+    simple_error = '-',
+    integer = ':',
+    bulk_string = '$',
+    array = '*',
+
+    pub fn format(
+        self: @This(),
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        try writer.writeByte(@intFromEnum(self));
+    }
+};
+
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
 
@@ -13,8 +30,11 @@ pub fn main() !void {
 
     while (true) {
         const connection = try listener.accept();
+        defer connection.stream.close();
 
         try stdout.print("accepted new connection", .{});
-        connection.stream.close();
+
+        const writer = connection.stream.writer().any();
+        try writer.print("{}PONG\r\n", .{Resp.simple_string});
     }
 }
