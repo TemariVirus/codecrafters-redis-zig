@@ -58,9 +58,7 @@ const Command = struct {
     pub fn parse(allocator: Allocator, reader: AnyReader) ReadError!Command {
         // On 64-bit systems, the maximum value of u64 is 20 decimal digits long
         var len_buf: [20]u8 = undefined;
-        var args: [][]u8 = undefined;
-
-        {
+        var args: std.ArrayList([]u8) = blk: {
             const len_str = try readPart(reader, &len_buf);
             assert(len_str[0] == @intFromEnum(Resp.array));
             const len = std.fmt.parseInt(usize, len_str[1..], 10) catch {
@@ -72,10 +70,16 @@ const Command = struct {
             if (len == 0) {
                 return error.Invalid;
             }
-            args = try allocator.alloc([]u8, len);
+            break :blk try .initCapacity(allocator, len);
+        };
+        errdefer {
+            for (args.items) |arg| {
+                allocator.free(arg);
+            }
+            args.deinit();
         }
 
-        for (0..args.len) |i| {
+        for (0..args.capacity) |i| {
             const len_str = try readPart(reader, &len_buf);
             assert(len_str[0] == @intFromEnum(Resp.bulk_string));
             const len = std.fmt.parseInt(usize, len_str[1..], 10) catch {
@@ -84,19 +88,18 @@ const Command = struct {
             };
             log.debug("Read str length {d}", .{len});
 
-            args[i] = try allocator.alloc(u8, len);
-            const data = try readPart(reader, args[i]);
+            args.appendAssumeCapacity(try allocator.alloc(u8, len));
+            const data = try readPart(reader, args.items[i]);
             log.debug("Read str data {s}", .{data});
-            assert(data.len == args[i].len);
+            assert(data.len == args.items[i].len);
         }
 
-        const command = CommandType.parse(args[0]) orelse {
-            log.info("Unsupported command: {s}", .{args[0]});
+        const command = CommandType.parse(args.items[0]) orelse {
+            log.info("Unsupported command: {s}", .{args.items[0]});
             return error.Unsupported;
         };
-        std.mem.copyForwards([]u8, args, args[1..]);
-        args = try allocator.realloc(args, args.len - 1);
-        return .{ .command = command, .args = args };
+        _ = args.orderedRemove(0);
+        return .{ .command = command, .args = try args.toOwnedSlice() };
     }
 
     /// Reads a part of a RESP message, blocking until the delimiter is found.
@@ -222,11 +225,30 @@ fn handle(writer: AnyWriter, command: Command) !void {
                 try respond(writer, .simple_error, "SET requries 2 arguments");
                 return;
             }
-            const key = try store.allocator.dupe(u8, command.args[0]);
-            errdefer store.allocator.free(key);
-            const value = try store.allocator.dupe(u8, command.args[1]);
-            errdefer store.allocator.free(value);
-            try store.put(key, value);
+
+            {
+                const gop = try store.getOrPut(command.args[0]);
+                errdefer if (!gop.found_existing) {
+                    _ = store.remove(command.args[0]);
+                };
+
+                var key = gop.key_ptr.*;
+                const value = try store.allocator.dupe(u8, command.args[1]);
+                errdefer store.allocator.free(value);
+                if (gop.found_existing) {
+                    // Don't free the key as it can be reused
+                    store.allocator.free(gop.value_ptr.*);
+                } else {
+                    key = try store.allocator.dupe(u8, command.args[0]);
+                }
+                errdefer if (!gop.found_existing) {
+                    store.allocator.free(key);
+                };
+
+                gop.key_ptr.* = key;
+                gop.value_ptr.* = value;
+            }
+
             try respond(writer, .simple_string, "OK");
         },
     }
