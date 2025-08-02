@@ -52,6 +52,7 @@ fn workerNoError(conn: net.Server.Connection) void {
 }
 
 fn worker(conn: net.Server.Connection) !void {
+    defer std.debug.print("Connection closed\n", .{});
     defer conn.stream.close();
 
     var command_buffer: [1024]u8 = undefined;
@@ -100,8 +101,6 @@ fn worker(conn: net.Server.Connection) !void {
             continue :state .read_arr_len;
         },
     };
-
-    std.debug.print("Connection closed\n", .{});
 }
 
 /// Reads a part of a RESP message, blocking until a delimiter is found.
@@ -110,12 +109,13 @@ fn worker(conn: net.Server.Connection) !void {
 fn readPart(reader: AnyReader, buf: []u8) ?[]u8 {
     var fbs = std.io.fixedBufferStream(buf);
     while (true) {
+        // Would be nice to do this without blocking, but will have to wait for zig 0.15
         reader.streamUntilDelimiter(fbs.writer(), '\r', null) catch |err| switch (err) {
             // Connection closed
-            error.ConnectionResetByPeer, error.ConnectionTimedOut => return null,
-            // Wait for data
-            // Would be nice to do this without blocking, but will have to wait for zig 0.15
-            error.EndOfStream => continue,
+            error.ConnectionResetByPeer,
+            error.ConnectionTimedOut,
+            error.EndOfStream,
+            => return null,
             else => {
                 const src = @src();
                 std.debug.print(
@@ -131,8 +131,11 @@ fn readPart(reader: AnyReader, buf: []u8) ?[]u8 {
     // Skip trailing \n
     while (true) {
         reader.skipBytes(1, .{ .buf_size = 1 }) catch |err| switch (err) {
-            error.ConnectionResetByPeer, error.ConnectionTimedOut => return null,
-            error.EndOfStream => continue,
+            // Connection closed
+            error.ConnectionResetByPeer,
+            error.ConnectionTimedOut,
+            error.EndOfStream,
+            => return null,
             else => {
                 std.debug.print("{} in {s}() in {s}:{d}\n", .{
                     err,
