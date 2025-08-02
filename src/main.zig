@@ -145,6 +145,7 @@ var store: std.StringHashMap(struct {
     /// Unix epoch in milliseconds
     expiry: i64,
 }) = undefined;
+var store_lock: std.Thread.Mutex = .{};
 
 pub fn main() !void {
     const allocator = std.heap.smp_allocator;
@@ -223,16 +224,19 @@ fn handle(writer: AnyWriter, command: Command) !void {
             const now = std.time.milliTimestamp();
             const key = command.args[0];
 
-            const record = store.get(key) orelse {
-                try respond(writer, .bulk_string, null);
-                return;
+            const res = blk: {
+                store_lock.lock();
+                defer store_lock.unlock();
+
+                const record = store.get(key) orelse break :blk null;
+                if (now > record.expiry) {
+                    _ = store.remove(key);
+                    break :blk null;
+                } else {
+                    break :blk record.value;
+                }
             };
-            if (now > record.expiry) {
-                _ = store.remove(key);
-                try respond(writer, .bulk_string, null);
-            } else {
-                try respond(writer, .bulk_string, record.value);
-            }
+            try respond(writer, .bulk_string, res);
         },
         .ping => try respond(writer, .simple_string, "PONG"),
         .set => {
@@ -255,6 +259,9 @@ fn handle(writer: AnyWriter, command: Command) !void {
             } else std.math.maxInt(i64);
 
             {
+                store_lock.lock();
+                defer store_lock.unlock();
+
                 const gop = try store.getOrPut(command.args[0]);
                 errdefer if (!gop.found_existing) {
                     _ = store.remove(command.args[0]);
