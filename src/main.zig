@@ -140,7 +140,11 @@ const Command = struct {
     }
 };
 
-var store: std.StringHashMap([]const u8) = undefined;
+var store: std.StringHashMap(struct {
+    value: []const u8,
+    /// Unix epoch in milliseconds
+    expiry: i64,
+}) = undefined;
 
 pub fn main() !void {
     const allocator = std.heap.smp_allocator;
@@ -215,16 +219,40 @@ fn handle(writer: AnyWriter, command: Command) !void {
                 try respond(writer, .simple_error, "GET requries 1 argument");
                 return;
             }
+
+            const now = std.time.milliTimestamp();
             const key = command.args[0];
-            const value = store.get(key);
-            try respond(writer, .bulk_string, value);
+
+            const record = store.get(key) orelse {
+                try respond(writer, .bulk_string, null);
+                return;
+            };
+            if (now > record.expiry) {
+                _ = store.remove(key);
+                try respond(writer, .bulk_string, null);
+            } else {
+                try respond(writer, .bulk_string, record.value);
+            }
         },
         .ping => try respond(writer, .simple_string, "PONG"),
         .set => {
             if (command.args.len < 2) {
-                try respond(writer, .simple_error, "SET requries 2 arguments");
+                try respond(writer, .simple_error, "SET requries at least 2 arguments");
                 return;
             }
+
+            const expiry = if (command.args.len > 2 and std.ascii.eqlIgnoreCase("px", command.args[2])) blk: {
+                const now = std.time.milliTimestamp();
+                if (command.args.len < 4) {
+                    try respond(writer, .simple_error, "Missing milliseconds");
+                    return;
+                }
+                const ms = std.fmt.parseInt(i64, command.args[3], 10) catch {
+                    try respond(writer, .simple_error, "Invalid value for milliseconds");
+                    return;
+                };
+                break :blk now + ms;
+            } else std.math.maxInt(i64);
 
             {
                 const gop = try store.getOrPut(command.args[0]);
@@ -237,7 +265,7 @@ fn handle(writer: AnyWriter, command: Command) !void {
                 errdefer store.allocator.free(value);
                 if (gop.found_existing) {
                     // Don't free the key as it can be reused
-                    store.allocator.free(gop.value_ptr.*);
+                    store.allocator.free(gop.value_ptr.*.value);
                 } else {
                     key = try store.allocator.dupe(u8, command.args[0]);
                 }
@@ -246,7 +274,10 @@ fn handle(writer: AnyWriter, command: Command) !void {
                 };
 
                 gop.key_ptr.* = key;
-                gop.value_ptr.* = value;
+                gop.value_ptr.* = .{
+                    .value = value,
+                    .expiry = expiry,
+                };
             }
 
             try respond(writer, .simple_string, "OK");
@@ -259,7 +290,7 @@ fn respond(writer: AnyWriter, comptime kind: Resp, data: anytype) !void {
         .simple_string, .simple_error => try writer.print("{}{s}\r\n", .{ kind, data }),
         .integer => try writer.print("{}{d}\r\n", .{ kind, data }),
         .bulk_string => switch (@typeInfo(@TypeOf(data))) {
-            .optional => if (data) |str| {
+            .null, .optional => if (data) |str| {
                 try writer.print("{}{d}\r\n{s}\r\n", .{ kind, str.len, str });
             } else {
                 try writer.print("{}-1\r\n", .{kind});
