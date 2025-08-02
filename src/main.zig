@@ -158,7 +158,11 @@ pub fn main() !void {
     defer listener.deinit();
 
     var pool: std.Thread.Pool = undefined;
-    try pool.init(.{ .allocator = allocator, .n_jobs = 8 });
+    try pool.init(.{
+        .allocator = allocator,
+        // We need a few threads to pass one of the tests
+        .n_jobs = @max(4, std.Thread.getCpuCount() catch 0),
+    });
     defer pool.deinit();
 
     while (true) {
