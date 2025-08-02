@@ -1,4 +1,5 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const AnyReader = std.io.AnyReader;
 const AnyWriter = std.io.AnyWriter;
 const assert = std.debug.assert;
@@ -13,7 +14,7 @@ const Resp = enum(u8) {
     array = '*',
 
     pub fn format(
-        self: @This(),
+        self: Resp,
         comptime _: []const u8,
         _: std.fmt.FormatOptions,
         writer: anytype,
@@ -22,11 +23,112 @@ const Resp = enum(u8) {
     }
 };
 
-const CommandState = enum {
-    read_arr_len,
-    read_str_len,
-    read_str_data,
-    respond,
+const CommandType = enum {
+    ping,
+
+    pub const string_to_type: std.StaticStringMapWithEql(
+        CommandType,
+        std.ascii.eqlIgnoreCase,
+    ) = .initComptime(.{
+        .{ "ping", .ping },
+    });
+
+    pub fn parse(str: []const u8) ?CommandType {
+        return string_to_type.get(str);
+    }
+};
+
+const Command = struct {
+    command: CommandType,
+    args: [][]u8,
+
+    pub const ReadError = error{
+        ConnectionClosed,
+        Invalid,
+        OutOfMemory,
+        Unsupported,
+    };
+
+    pub fn parse(allocator: Allocator, reader: AnyReader) ReadError!Command {
+        // On 64-bit systems, the maximum value of u64 is 20 decimal digits long
+        var len_buf: [20]u8 = undefined;
+        var args: [][]u8 = undefined;
+
+        {
+            const len_str = try readPart(reader, &len_buf);
+            assert(len_str[0] == @intFromEnum(Resp.array));
+            const len = std.fmt.parseInt(usize, len_str[1..], 10) catch {
+                log.warn("Failed to parse array length: {s}", .{len_str[1..]});
+                return error.Invalid;
+            };
+            log.debug("Read array length {d}", .{len});
+
+            if (len == 0) {
+                return error.Invalid;
+            }
+            args = try allocator.alloc([]u8, len);
+        }
+
+        for (0..args.len) |i| {
+            const len_str = try readPart(reader, &len_buf);
+            assert(len_str[0] == @intFromEnum(Resp.bulk_string));
+            const len = std.fmt.parseInt(usize, len_str[1..], 10) catch {
+                log.warn("Failed to parse string length: {s}", .{len_str[1..]});
+                return error.Invalid;
+            };
+            log.debug("Read str length {d}", .{len});
+
+            args[i] = try allocator.alloc(u8, len);
+            const data = try readPart(reader, args[i]);
+            log.debug("Read str data {s}", .{data});
+            assert(data.len == args[i].len);
+        }
+
+        const command = CommandType.parse(args[0]) orelse {
+            log.info("Unsupported command: {s}", .{args[0]});
+            return error.Unsupported;
+        };
+        std.mem.copyForwards([]u8, args, args[1..]);
+        args = try allocator.realloc(args, args.len - 1);
+        return .{ .command = command, .args = args };
+    }
+
+    /// Reads a part of a RESP message, blocking until the delimiter is found.
+    fn readPart(reader: AnyReader, buf: []u8) ReadError![]u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        // Would be nice to do this without blocking, but will have to wait for zig 0.15
+        reader.streamUntilDelimiter(fbs.writer(), '\r', null) catch |err| switch (err) {
+            // Number was too large, or string length given by protocol was not respected
+            error.NoSpaceLeft => return error.Invalid,
+            else => return error.ConnectionClosed,
+        };
+        // Skip trailing \n
+        reader.skipBytes(1, .{ .buf_size = 1 }) catch return error.ConnectionClosed;
+        return fbs.getWritten();
+    }
+
+    pub fn deinit(self: Command, allocator: Allocator) void {
+        for (self.args) |arg| {
+            allocator.free(arg);
+        }
+        allocator.free(self.args);
+    }
+
+    pub fn format(
+        self: Command,
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        try writer.print("{} [", .{self.command});
+        for (self.args, 0..) |arg, i| {
+            if (i > 0) {
+                try writer.writeByte(' ');
+            }
+            try writer.writeAll(arg);
+        }
+        try writer.writeByte(']');
+    }
 };
 
 pub fn main() !void {
@@ -42,77 +144,43 @@ pub fn main() !void {
 
     while (true) {
         const conn = listener.accept() catch continue;
-        try pool.spawn(workerNoError, .{conn});
+        try pool.spawn(workerNoError, .{ allocator, conn });
     }
 }
 
-fn workerNoError(conn: net.Server.Connection) void {
-    worker(conn) catch |err| {
+fn workerNoError(allocator: Allocator, conn: net.Server.Connection) void {
+    worker(allocator, conn) catch |err| {
         log.warn("Error in worker thread: {}", .{err});
     };
 }
 
-fn worker(conn: net.Server.Connection) !void {
+fn worker(allocator: Allocator, conn: net.Server.Connection) !void {
     defer log.info("Connection closed", .{});
     defer conn.stream.close();
 
-    var command_buffer: [1024]u8 = undefined;
     log.info("Accepted connection", .{});
 
     const reader = conn.stream.reader().any();
     const writer = conn.stream.writer().any();
-    var str_count: usize = undefined;
-    _ = state: switch (CommandState.read_arr_len) {
-        .read_arr_len => {
-            const len_str = readPart(reader, &command_buffer) orelse return;
-            assert(len_str[0] == @intFromEnum(Resp.array));
-            str_count = std.fmt.parseInt(usize, len_str[1..], 10) catch {
-                log.warn("Failed to parse array length: {s}", .{len_str[1..]});
-                return;
-            };
 
-            log.debug("Read array length {d}", .{str_count});
-            continue :state .read_str_len;
-        },
-        .read_str_len => {
-            const len_str = readPart(reader, &command_buffer) orelse return;
-            assert(len_str[0] == @intFromEnum(Resp.bulk_string));
-            const len = std.fmt.parseInt(usize, len_str[1..], 10) catch {
-                log.warn("Failed to parse string length: {s}", .{len_str[1..]});
-                return;
-            };
+    while (true) {
+        const command = Command.parse(allocator, reader) catch |err| switch (err) {
+            error.ConnectionClosed => return,
+            error.Unsupported => {
+                // TODO: change this from a string to an error
+                // Left as a string for now for easier local debugging
+                try writer.print("{}Unsupported command\r\n", .{Resp.simple_string});
+                continue;
+            },
+            else => {
+                try writer.print("{}Unexpected\r\n", .{Resp.simple_error});
+                return err;
+            },
+        };
+        log.info("Received: {}\n", .{command});
+        log.debug("responding", .{});
 
-            log.debug("Read str length {d}", .{len});
-            continue :state .read_str_data;
-        },
-        .read_str_data => {
-            const data = readPart(reader, &command_buffer) orelse return;
-            log.debug("Read str data {s}", .{data});
-            str_count -= 1;
-            if (str_count == 0) {
-                continue :state .respond;
-            }
-            continue :state .read_str_len;
-        },
-        .respond => {
-            log.debug("responding", .{});
-
-            // Hardcoded PONG
-            try writer.print("{}PONG\r\n", .{Resp.simple_string});
-
-            continue :state .read_arr_len;
-        },
-    };
-}
-
-/// Reads a part of a RESP message, blocking until a delimiter is found.
-/// Returns `null` if the connection is closed or an error occurs.
-/// Otherwise, writes the data without the delimiter to `buf`.
-fn readPart(reader: AnyReader, buf: []u8) ?[]u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    // Would be nice to do this without blocking, but will have to wait for zig 0.15
-    reader.streamUntilDelimiter(fbs.writer(), '\r', null) catch return null;
-    // Skip trailing \n
-    reader.skipBytes(1, .{ .buf_size = 1 }) catch return null;
-    return fbs.getWritten();
+        // Hardcoded PONG
+        try writer.print("{}PONG\r\n", .{Resp.simple_string});
+    }
 }
